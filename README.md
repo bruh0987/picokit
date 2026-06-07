@@ -1,15 +1,9 @@
 # picokit
 
-To install dependencies:
+This is a react metaframework.
 
-```bash
-bun install
-```
+It isn't the best framework.
 
-To run:
+But it is *my* framework.
 
-```bash
-bun run index.ts
-```
-
-This project was created using `bun init` in bun v1.3.14. [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.
+Enjoy.
