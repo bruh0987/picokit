@@ -57,13 +57,17 @@ export class SpaCompiler {
 
     for (const page of Object.values(spaPages)) {
       const componentImport = await this.resolveComponentImport(page);
-      const backendResult = await backendCompiler.compileComponentFile(componentImport.specifier);
+      const backendResult = await backendCompiler.compileComponentFile(
+        componentImport.specifier,
+        page.route,
+        componentImport.local,
+      );
       const backendModule = await import(backendResult.handlers[0]?.modulePath ?? "data:text/javascript,export const handlers=[]");
       this.backendHandlers.push(...(backendModule.handlers ?? []));
       const clientComponentImport = { ...componentImport, specifier: this.importPath(backendResult.clientFile) };
       const entryPath = `${this.tmpDir}\\${this.safeRouteName(page.route)}-entry.tsx`;
 
-      await Bun.write(entryPath, this.generateEntry(clientComponentImport));
+      await Bun.write(entryPath, this.generateEntry(page.route, clientComponentImport));
 
       const buildResult = await Bun.build({
         entrypoints: [entryPath],
@@ -173,7 +177,7 @@ export class SpaCompiler {
     return declaration.test(source) || list.test(source);
   }
 
-  private generateEntry(componentImport: ComponentImport) {
+  private generateEntry(route: string, componentImport: ComponentImport) {
     const componentImportLine =
       componentImport.kind === "default"
         ? `import Component from "${componentImport.specifier}";`
@@ -183,11 +187,27 @@ export class SpaCompiler {
 
     return `import React from "react";
 import { createRoot } from "react-dom/client";
+import { RouteContext, matchRoute } from "../src/router";
 ${componentImportLine}
 
 const container = document.getElementById("root");
+const route = ${JSON.stringify(this.normalizeRoute(route))};
+const pathname = window.location.pathname;
+const params = matchRoute(route, pathname) || {};
+const routeState = {
+  pathname,
+  params,
+  search: new URLSearchParams(window.location.search),
+};
+
 if (container) {
-  createRoot(container).render(React.createElement(Component));
+  createRoot(container).render(
+    React.createElement(
+      RouteContext.Provider,
+      { value: routeState },
+      React.createElement(Component)
+    )
+  );
 }
 `;
   }
@@ -225,6 +245,13 @@ if (container) {
 
   private importPath(file: string) {
     return file.replace(/\\/g, "/");
+  }
+
+  private normalizeRoute(route: string) {
+    const normalized = route.startsWith("/") ? route : `/${route}`;
+    return normalized.length > 1 && normalized.endsWith("/")
+      ? normalized.slice(0, -1)
+      : normalized;
   }
 
   private safeRouteName(route: string) {

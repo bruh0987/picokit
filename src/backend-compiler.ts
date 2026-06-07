@@ -1,4 +1,5 @@
 import ts from "typescript";
+import { validateRouteParamUsage } from "./route-validator";
 
 export type BackendCompileResult = {
   clientFile: string;
@@ -13,8 +14,12 @@ type ExtractedHandler = {
 export class BackendCompiler {
   constructor(private tmpDir: string) {}
 
-  async compileComponentFile(sourceFile: string): Promise<BackendCompileResult> {
+  async compileComponentFile(sourceFile: string, route?: string, componentName?: string): Promise<BackendCompileResult> {
     const source = await Bun.file(sourceFile).text();
+    if (route && componentName) {
+      validateRouteParamUsage(sourceFile, source, route, componentName);
+    }
+
     const parsed = ts.createSourceFile(sourceFile, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
     const extracted: ExtractedHandler[] = [];
 

@@ -1,11 +1,14 @@
 import React, { useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
+import { RouteContext, matchRoute } from "../src/router";
 import { AppPage as Route0 } from "C:/Users/igi/Desktop/picokit/.picokit/_Users_igi_Desktop_picokit_example_src___components_components_tsx-client.tsx";
+import { TodoDetailPage as Route1 } from "C:/Users/igi/Desktop/picokit/.picokit/_Users_igi_Desktop_picokit_example_src___components_TodoDetailPage_tsx-client.tsx";
 
 const base = "/app";
-const routes = {
-  "/": Route0,
-};
+const routes = [
+  { route: "/", Component: Route0 },
+  { route: "/todos/:id", Component: Route1 },
+];
 
 function getPath() {
   const path = window.location.pathname;
@@ -20,8 +23,25 @@ function subscribe(callback) {
 
 function Router() {
   const path = useSyncExternalStore(subscribe, getPath, () => "/");
-  const Component = routes[path] || routes["/"];
-  return Component ? React.createElement(Component) : React.createElement("h1", null, "Not Found");
+  const match = routes
+    .map((route) => ({ ...route, params: matchRoute(route.route, path) }))
+    .find((route) => route.params);
+  const fallback = routes.find((route) => route.route === "/");
+  const route = match || fallback;
+
+  if (!route) return React.createElement("h1", null, "Not Found");
+
+  return React.createElement(
+    RouteContext.Provider,
+    {
+      value: {
+        pathname: path,
+        params: route.params || {},
+        search: new URLSearchParams(window.location.search),
+      },
+    },
+    React.createElement(route.Component)
+  );
 }
 
 document.addEventListener("click", (event) => {

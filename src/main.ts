@@ -3,6 +3,7 @@ import { createElement } from "react";
 import { SpaCompiler, type SpaPage } from "./spa";
 import { Cluster, ClusterCompiler } from "./cluster";
 import type { BackendRuntimeHandler } from "./backend";
+import { matchRoute, normalizeRoute } from "./router";
 
 export const createApp = () => {
   return new App();
@@ -135,7 +136,7 @@ export class App {
 
         // SERVE CLIENT SCRIPTS
         if (path.startsWith("/_pico/bundle")) {
-          const targetRoute = path.replace("/_pico/bundle", "") || "/";
+          const targetRoute = decodeURIComponent(path.replace("/_pico/bundle", "")) || "/";
           const jsCode = this.spaCompiler.getBundle(targetRoute);
           if (jsCode) {
             return new Response(jsCode, {
@@ -155,8 +156,9 @@ export class App {
         }
 
         // SERVE SPA HTML SHELLS
-        if (this.spaPages[path]) {
-          const htmlShell = this.spaCompiler.generateHtmlShell(path);
+        const spaPage = this.findSpaPage(path);
+        if (spaPage) {
+          const htmlShell = this.spaCompiler.generateHtmlShell(spaPage.route);
           return new Response(htmlShell, {
             headers: { "Content-Type": "text/html" },
           });
@@ -182,11 +184,14 @@ export class App {
     )?.[1];
   }
 
+  private findSpaPage(path: string) {
+    return Object.values(this.spaPages).find((page) =>
+      matchRoute(page.route, path) !== undefined
+    );
+  }
+
   private normalizePath(path: string) {
-    const normalized = path.startsWith("/") ? path : `/${path}`;
-    return normalized.length > 1 && normalized.endsWith("/")
-      ? normalized.slice(0, -1)
-      : normalized;
+    return normalizeRoute(path);
   }
 
   private createBackendRoutes(handlers: BackendRuntimeHandler[]) {
