@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dev",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev"],
+      "port": 5173
+    },
+    {
+      "name": "db:studio",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "db:studio"],
+      "port": 4983
+    }
+  ]
+}

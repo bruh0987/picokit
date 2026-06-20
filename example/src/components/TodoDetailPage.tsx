@@ -7,7 +7,7 @@ import { todos } from "../db/schema";
 export const TodoDetailPage = () => {
   const route = useRoute();
   const id = Number(route.params.id);
-  const { data, loading, error } = useBackend(
+  const { data, loading, error, refetch } = useBackend(
     "todo_detail",
     async ({ input }) => {
       const [todo] = await db
@@ -37,7 +37,7 @@ export const TodoDetailPage = () => {
     <div>
       <h2>Todo detail</h2>
       <p>
-        <a href="/app">Back to todos</a>
+        <button onClick={() => route.navigate("/app")}>Back to todos</button>
       </p>
 
       {loading ? <p>Loading todo...</p> : null}
@@ -52,6 +52,7 @@ export const TodoDetailPage = () => {
           <button
             onClick={() =>
               updateTodo({ id: data.id, completed: !data.completed })
+                .then(refetch)
             }
             disabled={updateTodo.loading}
           >

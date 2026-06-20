@@ -22,6 +22,7 @@ export type BackendState<TOutput> = {
   data: TOutput | undefined;
   loading: boolean;
   error: Error | undefined;
+  refetch: () => Promise<void>;
 };
 
 export type BackendMutation<TInput, TOutput> = ((input: TInput) => Promise<TOutput>) & {
@@ -49,11 +50,8 @@ export function useBackend<TInput = unknown, TOutput = unknown>(
     setError(undefined);
 
     try {
-      const response = await fetch(`/_pico/backend/${encodeURIComponent(id)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: inputRef.current ?? null }),
-      });
+      const input = encodeURIComponent(JSON.stringify(inputRef.current ?? null));
+      const response = await fetch(`/_pico/backend/${encodeURIComponent(id)}?input=${input}`);
       const payload = (await response.json()) as { data?: TOutput; error?: string };
 
       if (!response.ok) {
@@ -72,7 +70,7 @@ export function useBackend<TInput = unknown, TOutput = unknown>(
     void load();
   }, [inputKey, load]);
 
-  return { data, loading, error };
+  return { data, loading, error, refetch: load };
 }
 
 export function useMutationBackend<TInput = unknown, TOutput = unknown>(

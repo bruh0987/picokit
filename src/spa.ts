@@ -1,5 +1,6 @@
 import { $ } from "bun";
-import { BackendCompiler } from "./backend-compiler";
+import { BackendCompiler, type BackendCompileResult } from "./backend-compiler";
+import { importFresh } from "./utils";
 import type { BackendRuntimeHandler } from "./backend";
 
 export type SpaPage = {
@@ -20,8 +21,10 @@ type ComponentImport =
 
 export class SpaCompiler {
   private tmpDir: string;
-  private bundledSpas: Record<string, string> = {};
+  private entries: Record<string, string> = {};
+  private bundleCache: Record<string, string> = {};
   private backendHandlers: BackendRuntimeHandler[] = [];
+  private collectedModules = new Set<string>();
 
   constructor() {
     this.tmpDir = `${process.cwd()}\\.picokit`;
@@ -47,12 +50,20 @@ export class SpaCompiler {
     return { file: match[1], line: Number(match[2]) };
   }
 
-  async compile(spaPages: Record<string, SpaPage>) {
-    this.bundledSpas = {};
+  // Scan phase: AST-split each page, register its backend handlers, and write the
+  // client entry — but do NOT bundle. Bundling is deferred to getBundle() so the
+  // dev server can build a route lazily on first request.
+  async prepare(spaPages: Record<string, SpaPage>) {
+    this.entries = {};
+    this.bundleCache = {};
     this.backendHandlers = [];
+    this.collectedModules = new Set();
 
-    await $`rm -rf ${this.tmpDir}`.quiet();
-    await $`mkdir -p ${this.tmpDir}`.quiet();
+    // .nothrow(): on Windows, freshly-imported modules (the .fresh-*/static-* files)
+    // stay locked for the life of the process, so rm can't delete them — that's fine,
+    // they have unique names and are cleared on the next (unlocked) startup.
+    await $`rm -rf ${this.tmpDir}`.quiet().nothrow();
+    await $`mkdir -p ${this.tmpDir}`.quiet().nothrow();
     const backendCompiler = new BackendCompiler(this.tmpDir);
 
     for (const page of Object.values(spaPages)) {
@@ -62,40 +73,64 @@ export class SpaCompiler {
         page.route,
         componentImport.local,
       );
-      const backendModule = await import(backendResult.handlers[0]?.modulePath ?? "data:text/javascript,export const handlers=[]");
-      this.backendHandlers.push(...(backendModule.handlers ?? []));
+      await this.collectBackendHandlers(backendResult);
       const clientComponentImport = { ...componentImport, specifier: this.importPath(backendResult.clientFile) };
       const entryPath = `${this.tmpDir}\\${this.safeRouteName(page.route)}-entry.tsx`;
 
       await Bun.write(entryPath, this.generateEntry(page.route, clientComponentImport));
-
-      const buildResult = await Bun.build({
-        entrypoints: [entryPath],
-        target: "browser",
-        minify: false,
-      });
-
-      if (!buildResult.success) {
-        throw new Error(
-          `Build failed for SPA route [${page.route}]: ${buildResult.logs.join("\n")}`,
-        );
-      }
-
-      const output = buildResult.outputs[0];
-      if (!output) {
-        throw new Error(`Build produced no output for SPA route [${page.route}]`);
-      }
-
-      this.bundledSpas[page.route] = await output.text();
+      this.entries[page.route] = entryPath;
     }
   }
 
-  getBundle(route: string): string | undefined {
-    return this.bundledSpas[route];
+  // Bundle a single route on demand, caching the result. Throws on build failure
+  // so the dev server can surface it as an overlay.
+  async getBundle(route: string): Promise<string | undefined> {
+    if (this.bundleCache[route]) return this.bundleCache[route];
+
+    const entryPath = this.entries[route];
+    if (!entryPath) return undefined;
+
+    const buildResult = await Bun.build({
+      entrypoints: [entryPath],
+      target: "browser",
+      minify: false,
+    });
+
+    if (!buildResult.success) {
+      throw new Error(
+        `Build failed for SPA route [${route}]: ${buildResult.logs.join("\n")}`,
+      );
+    }
+
+    const output = buildResult.outputs[0];
+    if (!output) {
+      throw new Error(`Build produced no output for SPA route [${route}]`);
+    }
+
+    const code = await output.text();
+    this.bundleCache[route] = code;
+    return code;
   }
 
   getBackendHandlers() {
     return this.backendHandlers;
+  }
+
+  getRoutes() {
+    return Object.keys(this.entries);
+  }
+
+  private async collectBackendHandlers(backendResult: BackendCompileResult) {
+    // All handlers in a file share one generated module; import it once even if
+    // several pages live in the same source file.
+    const modulePath = backendResult.handlers[0]?.modulePath;
+    if (!modulePath || this.collectedModules.has(modulePath)) return;
+
+    this.collectedModules.add(modulePath);
+    // importFresh re-evaluates edited handler bodies on a dev recompile (Bun caches
+    // by path and ignores query strings, so a plain re-import would be stale).
+    const backendModule = await importFresh(modulePath);
+    this.backendHandlers.push(...((backendModule.handlers as BackendRuntimeHandler[]) ?? []));
   }
 
   generateHtmlShell(route: string): string {
@@ -198,6 +233,11 @@ const routeState = {
   pathname,
   params,
   search: new URLSearchParams(window.location.search),
+  navigate: (to) => {
+    window.history.pushState({}, "", to);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  },
+  back: () => window.history.back(),
 };
 
 if (container) {

@@ -4,7 +4,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "example": "bun run --watch example/src/app.ts",
+    "dev": "bun run example/src/app.ts dev",
+    "start": "bun run example/src/app.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio"

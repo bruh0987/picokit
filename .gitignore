@@ -6,6 +6,9 @@ out
 dist
 *.tgz
 
+# picokit generated dev/build artifacts
+.picokit
+
 # code coverage
 coverage
 *.lcov
