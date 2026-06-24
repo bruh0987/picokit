@@ -1,5 +1,6 @@
 import { useBackend, useMutationBackend } from "../../../src/backend";
 import { useRoute } from "../../../src/router";
+import { Head } from "../../../src/head";
 import { eq } from "drizzle-orm";
 import { db } from "../db/client";
 import { todos } from "../db/schema";
@@ -35,6 +36,9 @@ export const TodoDetailPage = () => {
 
   return (
     <div>
+      <Head
+        title={data ? `${data.title} · picokit` : `Todo #${route.params.id} · picokit`}
+      />
       <h2>Todo detail</h2>
       <p>
         <button onClick={() => route.navigate("/app")}>Back to todos</button>

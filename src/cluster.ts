@@ -1,5 +1,6 @@
 import { $ } from "bun";
 import { BackendCompiler, type BackendCompileResult } from "./backend-compiler";
+import { collectHead } from "./head-render";
 import { importFresh } from "./utils";
 import type { BackendRuntimeHandler } from "./backend";
 
@@ -51,6 +52,7 @@ export class Cluster {
 export class ClusterCompiler {
   private tmpDir = `${process.cwd()}\\.picokit`;
   private entries: Record<string, string> = {};
+  private heads: Record<string, string> = {};
   private bundleCache: Record<string, string> = {};
   private backendHandlers: BackendRuntimeHandler[] = [];
   private collectedModules = new Set<string>();
@@ -80,6 +82,7 @@ export class ClusterCompiler {
   // builds a cluster lazily on first request.
   async prepare(clusters: Record<string, Cluster>) {
     this.entries = {};
+    this.heads = {};
     this.bundleCache = {};
     this.backendHandlers = [];
     this.collectedModules = new Set();
@@ -111,6 +114,12 @@ export class ClusterCompiler {
 
       await Bun.write(entryPath, this.generateEntry(cluster.coreRoute, routes, layoutImport));
       this.entries[cluster.coreRoute] = entryPath;
+      // Bake the head of the route the shell first lands on (the cluster's "/", or
+      // the first declared route). Client-side navigation updates it from there.
+      const indexRoute = cluster.routes["/"] ?? Object.values(cluster.routes)[0];
+      if (indexRoute) {
+        this.heads[cluster.coreRoute] = collectHead(indexRoute.component, indexRoute.route);
+      }
     }
   }
 
@@ -157,13 +166,13 @@ export class ClusterCompiler {
   }
 
   generateHtmlShell(coreRoute: string): string {
+    const head = this.heads[coreRoute];
     return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SPA Cluster</title>
-</head>
+${head ? `${head}\n` : ""}</head>
 <body>
   <div id="root"></div>
   <script type="module" src="/_pico/cluster${coreRoute}"></script>
@@ -344,6 +353,9 @@ document.addEventListener("click", (event) => {
 
 const container = document.getElementById("root");
 if (container) {
+  // Drop the server-baked head tags so React's <Head> becomes the sole owner of
+  // the head after mount (avoids stale/duplicate <title>/<meta> across navigation).
+  document.querySelectorAll("[data-pico-head]").forEach((el) => el.remove());
   createRoot(container).render(React.createElement(Router));
 }
 `;

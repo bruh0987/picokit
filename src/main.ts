@@ -6,6 +6,7 @@ import { $ } from "bun";
 import type { ServerWebSocket } from "bun";
 import { SpaCompiler, type SpaPage } from "./spa";
 import { Cluster, ClusterCompiler } from "./cluster";
+import { renderRoute } from "./head-render";
 import type { BackendRuntimeHandler } from "./backend";
 import { matchRoute, normalizeRoute } from "./router";
 
@@ -197,9 +198,8 @@ export class App {
       const component = options.dev
         ? (await this.resolveFreshComponent(page)) ?? page.component
         : page.component;
-      renderedPages[route] = ReactDOMServer.renderToStaticMarkup(
-        createElement(component),
-      );
+      const { head, body } = renderRoute(component, route);
+      renderedPages[route] = staticDocument(head, body);
     }
 
     const finishedApiRoutes = Object.fromEntries(
@@ -592,7 +592,15 @@ await import(pathToFileURL(entry).href);
       const target = await this.locateComponentModule(source, local, file);
       if (!target) return undefined;
 
-      const built = await Bun.build({ entrypoints: [target.path], target: "bun" });
+      // Keep React external so the fresh module reuses the host's React instance —
+      // otherwise a second bundled copy gives the component its own hook dispatcher
+      // and context identity, breaking hooks (e.g. <Head>'s collector context) when
+      // it's rendered here on the server.
+      const built = await Bun.build({
+        entrypoints: [target.path],
+        target: "bun",
+        external: ["react", "react-dom"],
+      });
       if (!built.success || !built.outputs[0]) return undefined;
 
       const tmp = `${process.cwd()}\\.picokit\\static-${Date.now()}-${this.freshStaticCounter++}.mjs`;
@@ -850,6 +858,19 @@ const devColor = {
   yellow: "\x1b[33m",
   reset: "\x1b[0m",
 };
+
+// Wrap a static page's rendered body in a full HTML document, baking in the head
+// metadata its <Head> declared so the response is a complete, SEO-friendly page.
+function staticDocument(head: string, body: string) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+${head ? `${head}\n` : ""}</head>
+<body>${body}</body>
+</html>`;
+}
 
 function debounce(fn: () => void, ms: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;
