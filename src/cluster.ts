@@ -1,5 +1,7 @@
 import { $ } from "bun";
-import { BackendCompiler } from "./backend-compiler";
+import { BackendCompiler, type BackendCompileResult } from "./backend-compiler";
+import { collectHead } from "./head-render";
+import { importFresh } from "./utils";
 import type { BackendRuntimeHandler } from "./backend";
 
 type SourceLocation = {
@@ -18,8 +20,16 @@ export type ClusterRoute = {
   callsite?: SourceLocation;
 };
 
+export type LayoutComponent = React.ComponentType<{ children: React.ReactNode }>;
+
+export type ClusterLayout = {
+  component: LayoutComponent;
+  callsite?: SourceLocation;
+};
+
 export class Cluster {
   routes: Record<string, ClusterRoute> = {};
+  layoutComponent?: ClusterLayout;
 
   constructor(public coreRoute: string) {}
 
@@ -30,12 +40,22 @@ export class Cluster {
       callsite: ClusterCompiler.getCallerLocation(),
     };
   }
+
+  layout(component: LayoutComponent) {
+    this.layoutComponent = {
+      component,
+      callsite: ClusterCompiler.getCallerLocation(),
+    };
+  }
 }
 
 export class ClusterCompiler {
   private tmpDir = `${process.cwd()}\\.picokit`;
-  private bundledClusters: Record<string, string> = {};
+  private entries: Record<string, string> = {};
+  private heads: Record<string, string> = {};
+  private bundleCache: Record<string, string> = {};
   private backendHandlers: BackendRuntimeHandler[] = [];
+  private collectedModules = new Set<string>();
 
   static getCallerLocation(): SourceLocation | undefined {
     const stack = new Error().stack;
@@ -57,77 +77,132 @@ export class ClusterCompiler {
     return { file: match[1], line: Number(match[2]) };
   }
 
-  async compile(clusters: Record<string, Cluster>) {
-    this.bundledClusters = {};
+  // Scan phase: AST-split every route + layout in each cluster, register backend
+  // handlers, and write the cluster client entry — without bundling. getBundle()
+  // builds a cluster lazily on first request.
+  async prepare(clusters: Record<string, Cluster>) {
+    this.entries = {};
+    this.heads = {};
+    this.bundleCache = {};
     this.backendHandlers = [];
+    this.collectedModules = new Set();
 
     await $`mkdir -p ${this.tmpDir}`.quiet();
     const backendCompiler = new BackendCompiler(this.tmpDir);
 
     for (const cluster of Object.values(clusters)) {
-      const routes = await Promise.all(
-        Object.values(cluster.routes).map(async (route) => {
-          const componentImport = await this.resolveComponentImport(route);
-          const backendResult = await backendCompiler.compileComponentFile(
-            componentImport.specifier,
-            route.route,
-            componentImport.local,
-          );
-          const backendModule = await import(backendResult.handlers[0]?.modulePath ?? "data:text/javascript,export const handlers=[]");
-          this.backendHandlers.push(...(backendModule.handlers ?? []));
+      // Compile routes sequentially: two routes can share one source file, and
+      // concurrent Bun.write calls to that file's generated module would race
+      // (an import() can observe the file mid-truncation and register zero handlers).
+      const routes: Array<{ route: string; componentImport: ComponentImport }> = [];
+      for (const route of Object.values(cluster.routes)) {
+        const componentImport = await this.resolveComponentImport(route);
+        const backendResult = await backendCompiler.compileComponentFile(
+          componentImport.specifier,
+          route.route,
+          componentImport.local,
+        );
+        await this.collectBackendHandlers(backendResult);
 
-          return {
-            route: route.route,
-            componentImport: { ...componentImport, specifier: this.importPath(backendResult.clientFile) },
-          };
-        }),
-      );
+        routes.push({
+          route: route.route,
+          componentImport: { ...componentImport, specifier: this.importPath(backendResult.clientFile) },
+        });
+      }
+      const layoutImport = await this.resolveLayoutImport(cluster, backendCompiler);
       const entryPath = `${this.tmpDir}\\${this.safeRouteName(cluster.coreRoute)}-cluster-entry.tsx`;
 
-      await Bun.write(entryPath, this.generateEntry(cluster.coreRoute, routes));
-
-      const buildResult = await Bun.build({
-        entrypoints: [entryPath],
-        target: "browser",
-        minify: false,
-      });
-
-      if (!buildResult.success) {
-        throw new Error(
-          `Build failed for cluster [${cluster.coreRoute}]: ${buildResult.logs.join("\n")}`,
-        );
+      await Bun.write(entryPath, this.generateEntry(cluster.coreRoute, routes, layoutImport));
+      this.entries[cluster.coreRoute] = entryPath;
+      // Bake the head of the route the shell first lands on (the cluster's "/", or
+      // the first declared route). Client-side navigation updates it from there.
+      const indexRoute = cluster.routes["/"] ?? Object.values(cluster.routes)[0];
+      if (indexRoute) {
+        this.heads[cluster.coreRoute] = collectHead(indexRoute.component, indexRoute.route);
       }
-
-      const output = buildResult.outputs[0];
-      if (!output) {
-        throw new Error(`Build produced no output for cluster [${cluster.coreRoute}]`);
-      }
-
-      this.bundledClusters[cluster.coreRoute] = await output.text();
     }
   }
 
-  getBundle(coreRoute: string): string | undefined {
-    return this.bundledClusters[coreRoute];
+  async getBundle(coreRoute: string): Promise<string | undefined> {
+    if (this.bundleCache[coreRoute]) return this.bundleCache[coreRoute];
+
+    const entryPath = this.entries[coreRoute];
+    if (!entryPath) return undefined;
+
+    const buildResult = await Bun.build({
+      entrypoints: [entryPath],
+      target: "browser",
+      minify: false,
+    });
+
+    if (!buildResult.success) {
+      throw new Error(
+        `Build failed for cluster [${coreRoute}]: ${buildResult.logs.join("\n")}`,
+      );
+    }
+
+    const output = buildResult.outputs[0];
+    if (!output) {
+      throw new Error(`Build produced no output for cluster [${coreRoute}]`);
+    }
+
+    const code = await output.text();
+    this.bundleCache[coreRoute] = code;
+    return code;
   }
 
   getBackendHandlers() {
     return this.backendHandlers;
   }
 
+  getRoutes() {
+    return Object.keys(this.entries);
+  }
+
   generateHtmlShell(coreRoute: string): string {
+    const head = this.heads[coreRoute];
     return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SPA Cluster</title>
-</head>
+${head ? `${head}\n` : ""}</head>
 <body>
   <div id="root"></div>
   <script type="module" src="/_pico/cluster${coreRoute}"></script>
 </body>
 </html>`;
+  }
+
+  private async resolveLayoutImport(
+    cluster: Cluster,
+    backendCompiler: BackendCompiler,
+  ): Promise<ComponentImport | undefined> {
+    if (!cluster.layoutComponent) return undefined;
+
+    const componentImport = await this.resolveComponentImport({
+      route: `${cluster.coreRoute} (layout)`,
+      // The resolver only reads the component's name + callsite, not its props.
+      component: cluster.layoutComponent.component as React.ComponentType,
+      callsite: cluster.layoutComponent.callsite,
+    });
+    const backendResult = await backendCompiler.compileComponentFile(componentImport.specifier);
+    await this.collectBackendHandlers(backendResult);
+
+    return { ...componentImport, specifier: this.importPath(backendResult.clientFile) };
+  }
+
+  private async collectBackendHandlers(backendResult: BackendCompileResult) {
+    // All handlers in a file share one generated module; import it once even if
+    // several routes (or a layout) live in the same source file.
+    const modulePath = backendResult.handlers[0]?.modulePath;
+    if (!modulePath || this.collectedModules.has(modulePath)) return;
+
+    this.collectedModules.add(modulePath);
+    // importFresh re-evaluates edited handler bodies on a dev recompile (Bun caches
+    // by path and ignores query strings, so a plain re-import would be stale).
+    const backendModule = await importFresh(modulePath);
+    this.backendHandlers.push(...((backendModule.handlers as BackendRuntimeHandler[]) ?? []));
   }
 
   private async resolveComponentImport(route: ClusterRoute): Promise<ComponentImport> {
@@ -196,15 +271,18 @@ export class ClusterCompiler {
   private generateEntry(
     coreRoute: string,
     routes: Array<{ route: string; componentImport: ComponentImport }>,
+    layoutImport?: ComponentImport,
   ) {
     const imports = routes
       .map(({ componentImport }, index) => this.generateImport(componentImport, `Route${index}`))
       .join("\n");
+    const layoutImportLine = layoutImport ? this.generateImport(layoutImport, "Layout") : "";
 
     return `import React, { useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { RouteContext, matchRoute } from "../src/router";
 ${imports}
+${layoutImportLine}
 
 const base = ${JSON.stringify(this.normalizeRoute(coreRoute))};
 const routes = [
@@ -227,6 +305,11 @@ function subscribe(callback) {
   return () => window.removeEventListener("popstate", callback);
 }
 
+function navigate(to) {
+  window.history.pushState({}, "", to);
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
 function Router() {
   const path = useSyncExternalStore(subscribe, getPath, () => "/");
   const match = routes
@@ -235,18 +318,23 @@ function Router() {
   const fallback = routes.find((route) => route.route === "/");
   const route = match || fallback;
 
-  if (!route) return React.createElement("h1", null, "Not Found");
+  const page = route
+    ? React.createElement(route.Component)
+    : React.createElement("h1", null, "Not Found");
+  const content = ${layoutImport ? "React.createElement(Layout, null, page)" : "page"};
 
   return React.createElement(
     RouteContext.Provider,
     {
       value: {
         pathname: path,
-        params: route.params || {},
+        params: route?.params || {},
         search: new URLSearchParams(window.location.search),
+        navigate,
+        back: () => window.history.back(),
       },
     },
-    React.createElement(route.Component)
+    content
   );
 }
 
@@ -254,12 +342,14 @@ document.addEventListener("click", (event) => {
   const link = event.target.closest("a");
   if (!link || link.origin !== window.location.origin || !link.pathname.startsWith(base)) return;
   event.preventDefault();
-  window.history.pushState({}, "", link.href);
-  window.dispatchEvent(new PopStateEvent("popstate"));
+  navigate(link.href);
 });
 
 const container = document.getElementById("root");
 if (container) {
+  // Drop the server-baked head tags so React's <Head> becomes the sole owner of
+  // the head after mount (avoids stale/duplicate <title>/<meta> across navigation).
+  document.querySelectorAll("[data-pico-head]").forEach((el) => el.remove());
   createRoot(container).render(React.createElement(Router));
 }
 `;

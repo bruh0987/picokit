@@ -6,6 +6,13 @@ out
 dist
 *.tgz
 
+# picokit generated dev/build artifacts
+.picokit
+
+# local example database (created on first run when Turso isn't configured)
+example/*.db
+example/*.db-*
+
 # code coverage
 coverage
 *.lcov

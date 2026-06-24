@@ -6,12 +6,16 @@ export type RouteState = {
   pathname: string;
   params: RouteParams;
   search: URLSearchParams;
+  navigate: (to: string) => void;
+  back: () => void;
 };
 
 export const RouteContext = createContext<RouteState>({
   pathname: "/",
   params: {},
   search: new URLSearchParams(),
+  navigate: () => {},
+  back: () => {},
 });
 
 export function useRoute() {

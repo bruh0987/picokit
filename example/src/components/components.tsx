@@ -1,13 +1,61 @@
 import { useBackend, useMutationBackend } from "../../../src/backend";
+import { useRoute } from "../../../src/router";
+import { Head } from "../../../src/head";
 import { eq } from "drizzle-orm";
 import { useState } from "react";
-import type { FormEvent } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { db } from "../db/client";
 import { todos } from "../db/schema";
+
+export const AppLayout = ({ children }: { children: ReactNode }) => {
+  const { pathname } = useRoute();
+  // Lives in the layout, so it survives navigation between cluster routes.
+  const [count, setCount] = useState(0);
+
+  // pathname here is the cluster-nested path ("/", "/about"), not the full "/app/...".
+  const link = (nested: string, label: string) => (
+    <a
+      href={`/app${nested === "/" ? "" : nested}`}
+      style={{
+        fontWeight: pathname === nested ? "bold" : "normal",
+        marginRight: 12,
+      }}
+    >
+      {label}
+    </a>
+  );
+
+  return (
+    <div>
+      <nav
+        style={{
+          borderBottom: "1px solid #ccc",
+          paddingBottom: 8,
+          marginBottom: 16,
+        }}
+      >
+        {link("/", "Todos")}
+        {link("/about", "About")}
+        <button
+          onClick={() => setCount((value) => value + 1)}
+          style={{ float: "right" }}
+        >
+          layout state: {count}
+        </button>
+      </nav>
+      {children}
+    </div>
+  );
+};
 
 export const HomePage = () => {
   return (
     <div>
+      <Head
+        title="Todo app · picokit"
+        description="A tiny todo app built with picokit."
+        meta={[{ property: "og:title", content: "Todo app" }]}
+      />
       <h1>Todo app</h1>
 
       <p>
@@ -18,18 +66,27 @@ export const HomePage = () => {
   );
 };
 
+export const AboutPage = () => {
+  return (
+    <div>
+      <Head title="About · picokit" />
+      <h2>About</h2>
+      <p>
+        A tiny todo app built with picokit. Notice the nav-click counter
+        persists.
+      </p>
+    </div>
+  );
+};
+
 export const AppPage = () => {
   const [title, setTitle] = useState("");
-  const [refreshKey, setRefreshKey] = useState(0);
-  const { data, loading, error } = useBackend(
+  const { data, loading, error, refetch } = useBackend(
     "all_todos",
     async () => {
       return db.select().from(todos).all();
     },
-    { input: { refreshKey } },
   );
-
-  const refreshTodos = () => setRefreshKey((key) => key + 1);
 
   const createTodo = useMutationBackend<{ title: string }>(
     "create_todo",
@@ -78,11 +135,16 @@ export const AppPage = () => {
 
     await createTodo({ title: trimmedTitle });
     setTitle("");
-    refreshTodos();
+    await refetch();
   };
 
   return (
     <div>
+      <Head
+        title="Todos · picokit"
+        description="Manage your todos."
+        meta={[{ property: "og:title", content: "Todos" }]}
+      />
       <h2>Todo list</h2>
       <form onSubmit={onCreate}>
         <input
@@ -115,17 +177,15 @@ export const AppPage = () => {
                 checked={todo.completed}
                 onChange={() =>
                   updateTodo({ id: todo.id, completed: !todo.completed }).then(
-                    refreshTodos,
+                    refetch,
                   )
                 }
               />
               {todo.title}
-            </label>
-            {" "}
-            <a href={`/app/todos/${todo.id}`}>Open</a>
-            {" "}
+            </label>{" "}
+            <a href={`/app/todos/${todo.id}`}>Open</a>{" "}
             <button
-              onClick={() => deleteTodo({ id: todo.id }).then(refreshTodos)}
+              onClick={() => deleteTodo({ id: todo.id }).then(refetch)}
               disabled={deleteTodo.loading}
             >
               Delete
