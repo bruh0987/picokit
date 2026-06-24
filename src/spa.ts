@@ -83,8 +83,9 @@ export class SpaCompiler {
   }
 
   // Bundle a single route on demand, caching the result. Throws on build failure
-  // so the dev server can surface it as an overlay.
-  async getBundle(route: string): Promise<string | undefined> {
+  // so the dev server can surface it as an overlay. `minify` is used by the build
+  // command to emit production-sized assets; the dev/lazy path leaves it off.
+  async getBundle(route: string, options: { minify?: boolean } = {}): Promise<string | undefined> {
     if (this.bundleCache[route]) return this.bundleCache[route];
 
     const entryPath = this.entries[route];
@@ -93,7 +94,7 @@ export class SpaCompiler {
     const buildResult = await Bun.build({
       entrypoints: [entryPath],
       target: "browser",
-      minify: false,
+      minify: options.minify ?? false,
     });
 
     if (!buildResult.success) {
@@ -118,6 +119,12 @@ export class SpaCompiler {
 
   getRoutes() {
     return Object.keys(this.entries);
+  }
+
+  // The generated server-side handler modules collected during prepare(). The build
+  // command bundles these into dist so backend handlers run without re-AST-splitting.
+  getBackendModulePaths() {
+    return [...this.collectedModules];
   }
 
   private async collectBackendHandlers(backendResult: BackendCompileResult) {

@@ -1,7 +1,8 @@
 import ReactDOMServer from "react-dom/server";
 import { createElement } from "react";
-import { watch } from "node:fs";
+import { watch, existsSync, cpSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { $ } from "bun";
 import type { ServerWebSocket } from "bun";
 import { SpaCompiler, type SpaPage } from "./spa";
 import { Cluster, ClusterCompiler } from "./cluster";
@@ -49,11 +50,12 @@ type RuntimeApiRoutes = Record<
   }
 >;
 
-export type AppMode = "dev" | "prod";
+export type AppMode = "dev" | "prod" | "build";
 
 export type StartConfig = {
   port?: number;
   mode?: AppMode;
+  outDir?: string;
 };
 
 type StaticRoute = {
@@ -65,6 +67,23 @@ type CompiledApp = {
   backendRoutes: Record<string, BackendRuntimeHandler>;
   renderedPages: Record<string, string>;
   finishedApiRoutes: RuntimeApiRoutes;
+  // Absolute path to the directory served at /static/*. The project's static/ dir
+  // when compiling in-process; dist/static when serving a prebuilt build.
+  staticAssetsDir: string;
+  // Present only when serving a prebuilt dist: client bundles read from disk instead
+  // of compiled on demand. Keyed by the route as registered ("/", "/app", ...).
+  clientBundles?: {
+    spa: Record<string, string>;
+    cluster: Record<string, string>;
+  };
+};
+
+// dist/manifest.json — the contract between `build` and the generated dist entrypoint.
+type BuildManifest = {
+  static: Record<string, string>;
+  spa: Record<string, string>;
+  cluster: Record<string, string>;
+  backend: string[];
 };
 
 export class App {
@@ -134,20 +153,28 @@ export class App {
   }
 
   // Single entrypoint. The mode (from config or argv) decides what start() does:
-  // "dev" runs the watching dev server; "prod" compiles and serves. Future "build"
-  // mode will slot in here too.
+  // "dev" runs the watching dev server; "build" emits a dist and exits; "prod"
+  // serves — from a prebuilt dist when one is present, else compiling in-process.
   async start(config: StartConfig = {}) {
     const mode = config.mode ?? this.detectMode();
+
+    if (mode === "build") {
+      return this.build(config);
+    }
 
     if (mode === "dev") {
       return this.runDevServer(config);
     }
 
-    const compiled = await this.compile();
+    // The generated dist entrypoint sets PICO_DIST; serving from it skips all
+    // AST-splitting and browser bundling at startup.
+    const dist = process.env.PICO_DIST;
+    const compiled = dist ? await this.loadBuild(dist) : await this.compile();
     return this.serve(compiled, config);
   }
 
   private detectMode(): AppMode {
+    if (process.argv.includes("build")) return "build";
     if (process.argv.includes("dev")) return "dev";
     return "prod";
   }
@@ -187,7 +214,154 @@ export class App {
       ]),
     );
 
-    return { backendRoutes, renderedPages, finishedApiRoutes };
+    return {
+      backendRoutes,
+      renderedPages,
+      finishedApiRoutes,
+      staticAssetsDir: `${process.cwd()}\\static`,
+    };
+  }
+
+  // Ahead-of-time compile to a portable dist: minified client bundles, pre-rendered
+  // static HTML, self-contained server-side handler modules, and a generated entry
+  // (dist/server.ts) that boots this app in prod, serving those artifacts directly.
+  private async build(config: StartConfig) {
+    const outDir = config.outDir ?? `${process.cwd()}\\dist`;
+    const started = performance.now();
+    console.log(`${devColor.cyan}[picokit]${devColor.reset} building to ${outDir}`);
+
+    const compiled = await this.compile();
+    await $`rm -rf ${outDir}`.quiet().nothrow();
+
+    const manifest: BuildManifest = { static: {}, spa: {}, cluster: {}, backend: [] };
+
+    for (const [route, html] of Object.entries(compiled.renderedPages)) {
+      const rel = `public\\${this.safeRouteName(route)}.html`;
+      await Bun.write(`${outDir}\\${rel}`, html);
+      manifest.static[route] = this.posix(rel);
+    }
+
+    for (const route of this.spaCompiler.getRoutes()) {
+      const code = await this.spaCompiler.getBundle(route, { minify: true });
+      if (code === undefined) continue;
+      const rel = `public\\_pico\\bundle\\${this.safeRouteName(route)}.js`;
+      await Bun.write(`${outDir}\\${rel}`, code);
+      manifest.spa[route] = this.posix(rel);
+    }
+
+    for (const route of this.clusterCompiler.getRoutes()) {
+      const code = await this.clusterCompiler.getBundle(route, { minify: true });
+      if (code === undefined) continue;
+      const rel = `public\\_pico\\cluster\\${this.safeRouteName(route)}.js`;
+      await Bun.write(`${outDir}\\${rel}`, code);
+      manifest.cluster[route] = this.posix(rel);
+    }
+
+    // Bundle each generated handler module (target: bun) so its server-side imports
+    // — db client, drizzle, etc. — are inlined and the module runs without source.
+    const modulePaths = [
+      ...new Set([
+        ...this.spaCompiler.getBackendModulePaths(),
+        ...this.clusterCompiler.getBackendModulePaths(),
+      ]),
+    ];
+    for (let i = 0; i < modulePaths.length; i++) {
+      const built = await Bun.build({ entrypoints: [modulePaths[i]!], target: "bun" });
+      if (!built.success || !built.outputs[0]) {
+        throw new Error(`Failed to bundle backend module:\n${built.logs.join("\n")}`);
+      }
+      const rel = `server\\backend\\handlers-${i}.js`;
+      await Bun.write(`${outDir}\\${rel}`, await built.outputs[0].text());
+      manifest.backend.push(this.posix(rel));
+    }
+
+    // Copy the project's static/ assets verbatim so the prod server can serve them
+    // from dist/static at /static/* without the source tree present.
+    const srcStatic = `${process.cwd()}\\static`;
+    if (existsSync(srcStatic)) {
+      cpSync(srcStatic, `${outDir}\\static`, { recursive: true });
+      console.log(`${devColor.cyan}[picokit]${devColor.reset} copied static/ assets`);
+    }
+
+    await Bun.write(`${outDir}\\manifest.json`, JSON.stringify(manifest, null, 2));
+    await Bun.write(`${outDir}\\server.ts`, this.generateServerEntry());
+
+    const ms = Math.round(performance.now() - started);
+    const routes = Object.keys(manifest.static).length + Object.keys(manifest.spa).length + Object.keys(manifest.cluster).length;
+    console.log(
+      `${devColor.cyan}[picokit]${devColor.reset} built ${routes} route(s), ` +
+        `${manifest.backend.length} backend module(s) in ${ms}ms\n` +
+        `  run it with: ${devColor.yellow}bun run ${this.posix(outDir)}/server.ts${devColor.reset}`,
+    );
+  }
+
+  // The generated dist entrypoint. It re-runs the user's app module (the only source
+  // of middleware + api() handlers) but pins prod mode and points PICO_DIST at the
+  // dist dir, so start() serves prebuilt artifacts instead of recompiling.
+  private generateServerEntry() {
+    const entry = this.posix(process.argv[1] ?? "");
+    return `// Generated by \`picokit build\`. Run: bun run dist/server.ts
+import { pathToFileURL } from "node:url";
+
+process.env.PICO_DIST = import.meta.dir;
+const entry = ${JSON.stringify(entry)};
+process.argv = [process.execPath, entry, "prod"];
+await import(pathToFileURL(entry).href);
+`;
+  }
+
+  // Reconstruct a CompiledApp from a prebuilt dist: HTML + bundles are read from disk
+  // and handlers imported from the bundled modules — no AST work, no browser bundling.
+  private async loadBuild(distDir: string): Promise<CompiledApp> {
+    const manifest = (await Bun.file(`${distDir}\\manifest.json`).json()) as BuildManifest;
+
+    const renderedPages: Record<string, string> = {};
+    for (const [route, rel] of Object.entries(manifest.static)) {
+      renderedPages[route] = await Bun.file(`${distDir}\\${this.fromPosix(rel)}`).text();
+    }
+
+    const spa: Record<string, string> = {};
+    for (const [route, rel] of Object.entries(manifest.spa)) {
+      spa[route] = await Bun.file(`${distDir}\\${this.fromPosix(rel)}`).text();
+    }
+
+    const cluster: Record<string, string> = {};
+    for (const [route, rel] of Object.entries(manifest.cluster)) {
+      cluster[route] = await Bun.file(`${distDir}\\${this.fromPosix(rel)}`).text();
+    }
+
+    const handlers: BackendRuntimeHandler[] = [];
+    for (const rel of manifest.backend) {
+      const module = await import(pathToFileURL(`${distDir}\\${this.fromPosix(rel)}`).href);
+      handlers.push(...((module.handlers as BackendRuntimeHandler[]) ?? []));
+    }
+
+    const finishedApiRoutes = Object.fromEntries(
+      Object.entries(this.apiRoutes).map(([route, h]) => [
+        route,
+        { GET: h.get, POST: h.post, PUT: h.put, DELETE: h.delete },
+      ]),
+    );
+
+    return {
+      backendRoutes: this.createBackendRoutes(handlers),
+      renderedPages,
+      finishedApiRoutes,
+      staticAssetsDir: `${distDir}\\static`,
+      clientBundles: { spa, cluster },
+    };
+  }
+
+  private safeRouteName(route: string) {
+    return route === "/" ? "index" : route.replaceAll("/", "_").replace(/[^A-Za-z0-9_-]/g, "_").replace(/^_+/, "");
+  }
+
+  private posix(path: string) {
+    return path.replaceAll("\\", "/");
+  }
+
+  private fromPosix(path: string) {
+    return path.replaceAll("/", "\\");
   }
 
   private serve(compiled: CompiledApp, config: StartConfig) {
@@ -210,6 +384,8 @@ export class App {
             compiled.renderedPages,
             compiled.backendRoutes,
             compiled.finishedApiRoutes,
+            compiled.staticAssetsDir,
+            compiled.clientBundles,
           )
         );
       },
@@ -286,7 +462,7 @@ export class App {
         let response: Response;
         try {
           response = await this.runMiddleware(ctx, () =>
-            this.dispatch(req, url, path, method, compiled.renderedPages, compiled.backendRoutes, compiled.finishedApiRoutes),
+            this.dispatch(req, url, path, method, compiled.renderedPages, compiled.backendRoutes, compiled.finishedApiRoutes, compiled.staticAssetsDir, compiled.clientBundles),
           );
         } catch (cause) {
           return this.devErrorResponse(cause, path);
@@ -516,7 +692,16 @@ export class App {
     renderedPages: Record<string, string>,
     backendRoutes: Record<string, BackendRuntimeHandler>,
     finishedApiRoutes: RuntimeApiRoutes,
+    staticAssetsDir: string,
+    clientBundles?: CompiledApp["clientBundles"],
   ) {
+    // STATIC ASSETS — files from the project's static/ dir, served verbatim at
+    // /static/*. Checked first so the prefix is reserved; a miss falls through.
+    if (path.startsWith("/static/")) {
+      const asset = await this.serveStaticAsset(staticAssetsDir, path);
+      if (asset) return asset;
+    }
+
     // STATIC PAGES
     for (const [route, htmlString] of Object.entries(renderedPages)) {
       if (path === this.normalizePath(route)) {
@@ -555,10 +740,10 @@ export class App {
       }
     }
 
-    // SERVE CLIENT SCRIPTS
+    // SERVE CLIENT SCRIPTS — from the prebuilt dist when present, else compiled lazily.
     if (path.startsWith("/_pico/bundle")) {
       const targetRoute = decodeURIComponent(path.replace("/_pico/bundle", "")) || "/";
-      const jsCode = await this.spaCompiler.getBundle(targetRoute);
+      const jsCode = clientBundles?.spa[targetRoute] ?? (await this.spaCompiler.getBundle(targetRoute));
       if (jsCode) {
         return new Response(jsCode, {
           headers: { "Content-Type": "text/javascript" },
@@ -568,7 +753,7 @@ export class App {
 
     if (path.startsWith("/_pico/cluster")) {
       const targetRoute = path.replace("/_pico/cluster", "") || "/";
-      const jsCode = await this.clusterCompiler.getBundle(targetRoute);
+      const jsCode = clientBundles?.cluster[targetRoute] ?? (await this.clusterCompiler.getBundle(targetRoute));
       if (jsCode) {
         return new Response(jsCode, {
           headers: { "Content-Type": "text/javascript" },
@@ -593,6 +778,25 @@ export class App {
     }
 
     return new Response("Not Found", { status: 404 });
+  }
+
+  // Resolve /static/<path> to a file under staticAssetsDir. Rejects empty, dotted,
+  // and traversal segments so a crafted path can't escape the asset root, then
+  // streams the file — Bun sets Content-Type from the extension.
+  private async serveStaticAsset(staticDir: string, path: string): Promise<Response | undefined> {
+    const rel = decodeURIComponent(path.slice("/static/".length));
+    const segments = rel.split("/");
+    if (
+      segments.length === 0 ||
+      segments.some((segment) => segment === "" || segment === "." || segment === ".." || segment.includes("\\"))
+    ) {
+      return undefined;
+    }
+
+    const file = Bun.file(`${staticDir}\\${segments.join("\\")}`);
+    if (!(await file.exists())) return undefined;
+
+    return new Response(file);
   }
 
   private async readBackendInput(req: Request, url: URL) {

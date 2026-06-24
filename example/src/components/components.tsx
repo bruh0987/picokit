@@ -50,6 +50,7 @@ export const AppLayout = ({ children }: { children: ReactNode }) => {
 export const HomePage = () => {
   return (
     <div>
+      <img src="/static/logo.svg" alt="picokit logo" width={64} height={64} />
       <h1>Todo app</h1>
 
       <p>

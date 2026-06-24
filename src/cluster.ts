@@ -114,7 +114,7 @@ export class ClusterCompiler {
     }
   }
 
-  async getBundle(coreRoute: string): Promise<string | undefined> {
+  async getBundle(coreRoute: string, options: { minify?: boolean } = {}): Promise<string | undefined> {
     if (this.bundleCache[coreRoute]) return this.bundleCache[coreRoute];
 
     const entryPath = this.entries[coreRoute];
@@ -123,7 +123,7 @@ export class ClusterCompiler {
     const buildResult = await Bun.build({
       entrypoints: [entryPath],
       target: "browser",
-      minify: false,
+      minify: options.minify ?? false,
     });
 
     if (!buildResult.success) {
@@ -148,6 +148,12 @@ export class ClusterCompiler {
 
   getRoutes() {
     return Object.keys(this.entries);
+  }
+
+  // The generated server-side handler modules collected during prepare(). The build
+  // command bundles these into dist so backend handlers run without re-AST-splitting.
+  getBackendModulePaths() {
+    return [...this.collectedModules];
   }
 
   generateHtmlShell(coreRoute: string): string {

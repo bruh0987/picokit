@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "bun run example/src/app.ts dev",
     "start": "bun run example/src/app.ts",
+    "build": "bun run example/src/app.ts build",
+    "preview": "bun run dist/server.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio"
