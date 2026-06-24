@@ -1,5 +1,6 @@
 import { $ } from "bun";
 import { BackendCompiler, type BackendCompileResult } from "./backend-compiler";
+import { collectHead } from "./head-render";
 import { importFresh } from "./utils";
 import type { BackendRuntimeHandler } from "./backend";
 
@@ -22,6 +23,7 @@ type ComponentImport =
 export class SpaCompiler {
   private tmpDir: string;
   private entries: Record<string, string> = {};
+  private heads: Record<string, string> = {};
   private bundleCache: Record<string, string> = {};
   private backendHandlers: BackendRuntimeHandler[] = [];
   private collectedModules = new Set<string>();
@@ -55,6 +57,7 @@ export class SpaCompiler {
   // dev server can build a route lazily on first request.
   async prepare(spaPages: Record<string, SpaPage>) {
     this.entries = {};
+    this.heads = {};
     this.bundleCache = {};
     this.backendHandlers = [];
     this.collectedModules = new Set();
@@ -79,6 +82,9 @@ export class SpaCompiler {
 
       await Bun.write(entryPath, this.generateEntry(page.route, clientComponentImport));
       this.entries[page.route] = entryPath;
+      // Bake the route's <Head> metadata into the shell so the initial HTML carries
+      // the right <title>/<meta> before the bundle hydrates it.
+      this.heads[page.route] = collectHead(page.component, page.route);
     }
   }
 
@@ -135,13 +141,13 @@ export class SpaCompiler {
 
   generateHtmlShell(route: string): string {
     const bundleUrl = `/_pico/bundle${route === "/" ? "" : route}`;
+    const head = this.heads[route];
     return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SPA Page</title>
-</head>
+${head ? `${head}\n` : ""}</head>
 <body>
   <div id="root"></div>
   <script type="module" src="${bundleUrl}"></script>
@@ -241,6 +247,9 @@ const routeState = {
 };
 
 if (container) {
+  // Drop the server-baked head tags so React's <Head> becomes the sole owner of
+  // the head after mount (avoids stale/duplicate <title>/<meta> across navigation).
+  document.querySelectorAll("[data-pico-head]").forEach((el) => el.remove());
   createRoot(container).render(
     React.createElement(
       RouteContext.Provider,

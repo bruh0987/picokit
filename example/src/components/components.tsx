@@ -1,5 +1,6 @@
 import { useBackend, useMutationBackend } from "../../../src/backend";
 import { useRoute } from "../../../src/router";
+import { Head } from "../../../src/head";
 import { eq } from "drizzle-orm";
 import { useState } from "react";
 import type { FormEvent, ReactNode } from "react";
@@ -50,6 +51,11 @@ export const AppLayout = ({ children }: { children: ReactNode }) => {
 export const HomePage = () => {
   return (
     <div>
+      <Head
+        title="Todo app · picokit"
+        description="A tiny todo app built with picokit."
+        meta={[{ property: "og:title", content: "Todo app" }]}
+      />
       <h1>Todo app</h1>
 
       <p>
@@ -63,6 +69,7 @@ export const HomePage = () => {
 export const AboutPage = () => {
   return (
     <div>
+      <Head title="About · picokit" />
       <h2>About</h2>
       <p>
         A tiny todo app built with picokit. Notice the nav-click counter
@@ -133,6 +140,11 @@ export const AppPage = () => {
 
   return (
     <div>
+      <Head
+        title="Todos · picokit"
+        description="Manage your todos."
+        meta={[{ property: "og:title", content: "Todos" }]}
+      />
       <h2>Todo list</h2>
       <form onSubmit={onCreate}>
         <input
